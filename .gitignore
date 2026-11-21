@@ -1,0 +1,14 @@
+# сборка
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+out/
+# логи и снимки экрана: на них может быть код конфигурации
+logs/
+*.log
+screenshots/
+# Python
+__pycache__/
+*.pyc
