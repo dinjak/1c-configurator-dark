@@ -1,0 +1,3 @@
+# cmd.exe не разбирает пакетные файлы с LF
+*.cmd text eol=crlf
+*.bat text eol=crlf

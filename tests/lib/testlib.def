@@ -1,0 +1,6 @@
+LIBRARY testlib
+EXPORTS
+  tl_add
+  tl_mul
+  tl_sub
+  tl_fwd = kernel32.GetTickCount
