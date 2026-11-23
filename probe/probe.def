@@ -2,3 +2,5 @@ LIBRARY
 EXPORTS
   DtStart
   DtStop
+  DtDump
+  DtSnapshot DATA

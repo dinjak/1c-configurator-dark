@@ -6,9 +6,13 @@
 // них, права на запись — только после всех проверок. Операции над одним pid сериализует
 // Local\cfgdark-op-<pid>. DLL — только соседний с загрузчиком файл с фиксированным именем;
 // параметра --dll нет. Коды выхода — таблица docs/architecture.md, «Загрузчик».
+// probe-dump вызывает DtDump probe и печатает снимок DtSnapshot как JSON в stdout.
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdarg.h>
+#include <stdint.h>
+
+#include "probe/snapshot.h"
 
 namespace {
 
@@ -28,6 +32,7 @@ enum : int {
   kStillLoaded = 15,
   kForeign = 16,
   kBusy = 17,
+  kDumpFailed = 18,
 };
 
 #if defined(_M_X64)
@@ -60,6 +65,7 @@ const DWORD kLoadTimeoutMs = 15000;
 const DWORD kStartTimeoutMs = 10000;
 const DWORD kStopTimeoutMs = 5000;
 const DWORD kFreeTimeoutMs = 10000;
+const DWORD kDumpTimeoutMs = 5000;
 const DWORD kMaxDllBytes = 16u << 20;
 
 // Коды DtStart — те же, что в theme/theme.cpp и probe/probe.cpp.
@@ -132,7 +138,7 @@ const wchar_t kUsageText[] =
     L"  unload        выгрузить тему\n"
     L"  status        состояние: цель, битность, загружены ли тема и probe\n"
     L"  probe-load    загрузить диагностическую DLL\n"
-    L"  probe-dump    снять данные probe (пока не реализовано)\n"
+    L"  probe-dump    снять данные probe: JSON в stdout, счётчики эпохи обнуляются\n"
     L"  probe-unload  выгрузить probe\n"
     L"  --pid N       выбрать процесс; все проверки цели остаются\n"
     L"\n"
@@ -141,7 +147,8 @@ const wchar_t kUsageText[] =
     L"Коды выхода: 0 успех, 2 использование, 3 нет цели, 4 цель неоднозначна,\n"
     L"5 окно не простояло 25 с, 6 битность, 7 DLL, 10 уже загружено, 11 WinAPI,\n"
     L"12 DtStart, 13 не загружено, 14 DtStop, 15 модуль остался, 16 чужой модуль,\n"
-    L"17 над pid уже идёт операция другого загрузчика.\n";
+    L"17 над pid уже идёт операция другого загрузчика,\n"
+    L"18 probe-dump: DtDump не завершился за 5 с, вернул ошибку или снимок не прошёл проверку.\n";
 
 int usage() {
   write_text(STD_OUTPUT_HANDLE, kUsageText);
@@ -487,6 +494,20 @@ bool rva_to_off(const FileView& v, const Sections& s, DWORD rva, DWORD len, DWOR
   return false;
 }
 
+// Секция, целиком содержащая [rva, rva + len) по виртуальному размеру (данные .bss
+// в файле не лежат, поэтому rva_to_off для них не годится).
+bool rva_section(const Sections& s, DWORD rva, DWORD len, DWORD* chars) {
+  for (WORD i = 0; i < s.count; ++i) {
+    const IMAGE_SECTION_HEADER& h = s.sec[i];
+    DWORD vs = h.Misc.VirtualSize != 0 ? h.Misc.VirtualSize : h.SizeOfRawData;
+    if (rva < h.VirtualAddress || rva - h.VirtualAddress >= vs) continue;
+    if (len > vs - (rva - h.VirtualAddress)) return false;
+    *chars = h.Characteristics;
+    return true;
+  }
+  return false;
+}
+
 bool ascii_eq(const FileView& v, DWORD off, const char* want) {
   for (DWORD i = 0;; ++i) {
     if (off + i < off || off + i >= v.size) return false;
@@ -507,6 +528,7 @@ enum DllStatus {
   kDllMachine,
   kDllBad,
   kDllNoExport,
+  kDllNoProbeExport,
 };
 
 const wchar_t* dll_status_text(DllStatus s) {
@@ -521,6 +543,7 @@ const wchar_t* dll_status_text(DllStatus s) {
     case kDllMachine: return L"Machine не совпадает с битностью загрузчика";
     case kDllBad: return L"файл не PE-DLL или повреждён";
     case kDllNoExport: return L"нет экспортов DtStart/DtStop";
+    case kDllNoProbeExport: return L"нет экспортов probe DtDump/DtSnapshot";
   }
   return L"?";
 }
@@ -530,11 +553,13 @@ struct DllImage {
   HANDLE file;             // открыт без общего доступа на запись до конца операции
   DWORD rva_start;
   DWORD rva_stop;
+  DWORD rva_dump;      // только probe
+  DWORD rva_snapshot;  // только probe: DtSnapshot (DATA)
   DWORD time_stamp;
   DWORD size_of_image;
 };
 
-DllStatus parse_dll(const FileView& v, DllImage* out) {
+DllStatus parse_dll(Kind kind, const FileView& v, DllImage* out) {
   const IMAGE_NT_HEADERS* nt = nt_headers(v);
   if (nt == nullptr) return kDllBad;
   const IMAGE_FILE_HEADER& fh = nt->FileHeader;
@@ -572,15 +597,21 @@ DllStatus parse_dll(const FileView& v, DllImage* out) {
   const DWORD* names = reinterpret_cast<const DWORD*>(v.data + off_name);
   const WORD* ords = reinterpret_cast<const WORD*>(v.data + off_ord);
 
-  DWORD rva_start = 0, rva_stop = 0;
+  DWORD rva_start = 0, rva_stop = 0, rva_dump = 0, rva_snapshot = 0;
   for (DWORD i = 0; i < nname; ++i) {
     DWORD name_off = 0;
     if (!rva_to_off(v, s, names[i], 1, &name_off, nullptr)) return kDllBad;
     DWORD* slot = nullptr;
+    bool data = false;
     if (ascii_eq(v, name_off, "DtStart")) {
       slot = &rva_start;
     } else if (ascii_eq(v, name_off, "DtStop")) {
       slot = &rva_stop;
+    } else if (kind == kProbe && ascii_eq(v, name_off, "DtDump")) {
+      slot = &rva_dump;
+    } else if (kind == kProbe && ascii_eq(v, name_off, "DtSnapshot")) {
+      slot = &rva_snapshot;
+      data = true;
     } else {
       continue;
     }
@@ -588,13 +619,26 @@ DllStatus parse_dll(const FileView& v, DllImage* out) {
     DWORD fr = funs[ords[i]];
     if (fr == 0 || fr >= oh.SizeOfImage) return kDllBad;
     if (fr >= ed.VirtualAddress && fr - ed.VirtualAddress < ed.Size) return kDllBad;  // форвардер
-    DWORD fo = 0, chars = 0;
-    if (!rva_to_off(v, s, fr, 1, &fo, &chars) || !(chars & IMAGE_SCN_MEM_EXECUTE)) return kDllBad;
+    if (data) {
+      // Снимок: целиком в образе, в неисполняемой секции с записью.
+      DWORD chars = 0;
+      const DWORD need = static_cast<DWORD>(sizeof(dt::snap::ProbeSnapshot));
+      if (need > oh.SizeOfImage - fr || !rva_section(s, fr, need, &chars) || (chars & IMAGE_SCN_MEM_EXECUTE) ||
+          !(chars & IMAGE_SCN_MEM_WRITE)) {
+        return kDllBad;
+      }
+    } else {
+      DWORD fo = 0, chars = 0;
+      if (!rva_to_off(v, s, fr, 1, &fo, &chars) || !(chars & IMAGE_SCN_MEM_EXECUTE)) return kDllBad;
+    }
     *slot = fr;
   }
   if (rva_start == 0 || rva_stop == 0) return kDllNoExport;
+  if (kind == kProbe && (rva_dump == 0 || rva_snapshot == 0)) return kDllNoProbeExport;
   out->rva_start = rva_start;
   out->rva_stop = rva_stop;
+  out->rva_dump = rva_dump;
+  out->rva_snapshot = rva_snapshot;
   out->time_stamp = fh.TimeDateStamp;
   out->size_of_image = oh.SizeOfImage;
   return kDllOk;
@@ -670,7 +714,7 @@ DllStatus open_dll(Kind kind, DllImage* out) {
   DllStatus st = kDllRead;
   if (got == bytes) {
     FileView v = {data, bytes};
-    st = parse_dll(v, out);
+    st = parse_dll(kind, v, out);
   }
   HeapFree(GetProcessHeap(), 0, data);
   if (st != kDllOk) close_dll(out);
@@ -1141,6 +1185,410 @@ int cmd_unload(Kind kind, DWORD want) {
 }
 
 // ---------------------------------------------------------------------------
+// probe-dump: DtDump (5 с) → ReadProcessMemory(DtSnapshot) → проверка → JSON в stdout.
+// Только целые числа; хеши и цвета — hex-строки, вызывающий — basename модуля. Файлов
+// не пишет, перерисовки нет. Текста, глифов, заголовков, пикселей, адресов в снимке нет.
+
+wchar_t g_json[1025];
+int g_json_len = 0;
+
+void jflush() {
+  if (g_json_len == 0) return;
+  g_json[g_json_len] = 0;
+  write_text(STD_OUTPUT_HANDLE, g_json);
+  g_json_len = 0;
+}
+
+void jput(wchar_t c) {
+  if (g_json_len >= 1024) jflush();
+  g_json[g_json_len++] = c;
+}
+
+void jraw(const wchar_t* s) {
+  for (; *s; ++s) jput(*s);
+}
+
+void jascii(const char* s) {
+  for (; *s; ++s) jput(static_cast<wchar_t>(static_cast<unsigned char>(*s)));
+}
+
+// wsprintfW не умеет 64 бита — десятичное вручную.
+void ju64(uint64_t v) {
+  wchar_t d[21];
+  int n = 0;
+  do {
+    d[n++] = static_cast<wchar_t>(L'0' + v % 10);
+    v /= 10;
+  } while (v != 0);
+  while (n > 0) jput(d[--n]);
+}
+
+// ,"key":
+void jkey(bool* first, const char* key) {
+  if (!*first) jput(L',');
+  *first = false;
+  jput(L'"');
+  jascii(key);
+  jraw(L"\":");
+}
+
+void jkv(bool* first, const char* key, uint64_t v) {
+  jkey(first, key);
+  ju64(v);
+}
+
+void jstr(const char* s) {
+  jput(L'"');
+  jascii(s);
+  jput(L'"');
+}
+
+void jhex(uint32_t v) {
+  wchar_t b[16];
+  wsprintfW(b, L"\"%08lx\"", static_cast<unsigned long>(v));
+  jraw(b);
+}
+
+void jhex64(uint64_t v) {
+  wchar_t b[24];
+  wsprintfW(b, L"\"%08lx%08lx\"", static_cast<unsigned long>(v >> 32), static_cast<unsigned long>(v & 0xFFFFFFFFu));
+  jraw(b);
+}
+
+void jcaller(const dt::snap::ProbeSnapshot& s, uint8_t c) {
+  if (c < s.nnames) {
+    jput(L'"');
+    const uint16_t* n = s.names[c];
+    for (uint32_t i = 0; i < dt::snap::kNameLen && n[i]; ++i) {
+      wchar_t ch = static_cast<wchar_t>(n[i]);
+      if (ch == L'"' || ch == L'\\') {
+        jput(L'\\');
+        jput(ch);
+      } else if (ch < 0x20) {
+        jput(L'_');
+      } else {
+        jput(ch);
+      }
+    }
+    jput(L'"');
+  } else if (c == dt::snap::kCallerOther) {
+    jstr("other");
+  } else if (c == dt::snap::kCallerUnloaded) {
+    jstr("unloaded");
+  } else {
+    jstr("unknown");
+  }
+}
+
+const char* patch_status_name(uint8_t v) {
+  return v < dt::snap::kPatchStatusCount ? dt::snap::kPatchStatusNames[v] : "unknown";
+}
+
+bool snapshot_valid(dt::snap::ProbeSnapshot* s) {
+  using namespace dt::snap;
+  if (s->magic != kMagic || s->version != kVersion || s->size != sizeof(ProbeSnapshot) || s->machine != kMachine) {
+    return false;
+  }
+  if (s->nsurfaces > kSurfaces || s->ncolors > kColors || s->nalpha > kAlpha || s->nnames > kNames) return false;
+  for (uint32_t i = 0; i < kNames; ++i) s->names[i][kNameLen - 1] = 0;
+  return true;
+}
+
+void print_snapshot(const dt::snap::ProbeSnapshot& s) {
+  using namespace dt::snap;
+  bool top = true;
+  jput(L'{');
+  jkv(&top, "schema", 1);
+  jkey(&top, "arch");
+  jput(L'"');
+  jraw(kArch);
+  jput(L'"');
+  jkv(&top, "epoch", s.epoch);
+  jkv(&top, "t_ms", s.t_ms);
+  jkv(&top, "t_prev_ms", s.t_prev_ms);
+  jkv(&top, "qpc_freq", s.qpc_freq);
+  jraw(L"\n");
+
+  jkey(&top, "hooks");
+  bool f = true;
+  jput(L'{');
+  for (uint32_t k = 0; k < kHooks; ++k) {
+    jkey(&f, kHookNames[k]);
+    bool g = true;
+    jput(L'{');
+    jkey(&g, "state");
+    jstr(s.hook_state[k] < 4 ? kHookStateNames[s.hook_state[k]] : "unknown");
+    jkey(&g, "patch");
+    jstr(patch_status_name(s.hook_patch[k]));
+    jput(L'}');
+  }
+  jput(L'}');
+  jkey(&top, "getters_missing");
+  jput(L'[');
+  f = true;
+  for (uint32_t k = 0; k < kGetters; ++k) {
+    if (!(s.getters_missing & (1u << k))) continue;
+    if (!f) jput(L',');
+    f = false;
+    jstr(kGetterNames[k]);
+  }
+  jput(L']');
+  jkey(&top, "features");
+  f = true;
+  jput(L'{');
+  jkv(&f, "surf_hash", (s.features & kFeatSurfHash) ? 1 : 0);
+  jkv(&f, "text_color", (s.features & kFeatTextColor) ? 1 : 0);
+  jkv(&f, "dup", (s.features & kFeatDup) ? 1 : 0);
+  jput(L'}');
+  jkey(&top, "patch");
+  f = true;
+  jput(L'{');
+  for (uint32_t k = 0; k < kPatchStats; ++k) jkv(&f, kPatchStatNames[k], s.patch[k]);
+  jput(L'}');
+  jraw(L"\n");
+
+  jkey(&top, "calls");
+  f = true;
+  jput(L'{');
+  for (uint32_t c = 0; c < kEpochCounters; ++c) jkv(&f, kCounterNames[c], s.counters[c]);
+  jput(L'}');
+  jkey(&top, "overflow");
+  f = true;
+  jput(L'{');
+  for (uint32_t c = kEpochCounters; c < kOverflowEnd; ++c) jkv(&f, kCounterNames[c], s.counters[c]);
+  jput(L'}');
+  jraw(L"\n");
+
+  jkey(&top, "surfaces");
+  jput(L'[');
+  for (uint32_t i = 0; i < s.nsurfaces; ++i) {
+    const SnapSurface& o = s.surfaces[i];
+    if (i != 0) jraw(L",\n");
+    f = true;
+    jput(L'{');
+    jkey(&f, "hash");
+    jhex64(o.hash);
+    jkv(&f, "w", o.w);
+    jkv(&f, "h", o.h);
+    jkv(&f, "fmt", o.fmt);
+    jkey(&f, "caller");
+    jcaller(s, o.caller);
+    jkv(&f, "first_ms", o.first_ms);
+    jkv(&f, "hits", o.hits);
+    jput(L'}');
+  }
+  jput(L']');
+  jraw(L"\n");
+
+  jkey(&top, "text_colors");
+  jput(L'[');
+  for (uint32_t i = 0; i < s.ncolors; ++i) {
+    const SnapColor& o = s.colors[i];
+    if (i != 0) jraw(L",\n");
+    f = true;
+    jput(L'{');
+    jkey(&f, "rgba");
+    jhex(o.rgba);
+    jkey(&f, "caller");
+    jcaller(s, o.caller);
+    jkv(&f, "runs", o.runs);
+    jkv(&f, "glyphs", o.glyphs);
+    jkv(&f, "first_ms", o.first_ms);
+    jput(L'}');
+  }
+  jput(L']');
+  jkv(&top, "color_inexact", s.counters[kColorInexact]);
+  jraw(L"\n");
+
+  jkey(&top, "alpha_lt1");
+  jput(L'[');
+  for (uint32_t i = 0; i < s.nalpha; ++i) {
+    const SnapAlpha& o = s.alpha[i];
+    if (i != 0) jraw(L",\n");
+    f = true;
+    jput(L'{');
+    jkey(&f, "rgba");
+    jhex(o.rgba);
+    jkey(&f, "caller");
+    jcaller(s, o.caller);
+    jkv(&f, "calls", o.calls);
+    jput(L'}');
+  }
+  jput(L']');
+  jraw(L"\n");
+
+  jkey(&top, "layout");
+  f = true;
+  jput(L'{');
+  for (uint32_t c = kOverflowEnd; c < kCounters; ++c) jkv(&f, kCounterNames[c], s.counters[c]);
+  jkey(&f, "self_check");
+  jstr(s.self_check < 3 ? kSelfCheckNames[s.self_check] : "unknown");
+  jkv(&f, "self_check_seen", s.self_check_seen);
+  jkv(&f, "compiled_stride", s.compiled_stride);
+  jput(L'}');
+  jraw(L"\n");
+
+  jkey(&top, "dup");
+  f = true;
+  jput(L'{');
+  jkv(&f, "stride", s.self_check == kSelfPassed ? s.compiled_stride : 0);
+  jkey(&f, "bins");
+  jput(L'[');
+  bool fb = true;
+  for (uint32_t i = 0; i < kDupBins; ++i) {
+    if (s.dup_bins[i] == 0) continue;
+    uint32_t pos = i / 8, flags = i % 8;
+    int dx = static_cast<int>(pos % 15) - 7;
+    int dy = static_cast<int>(pos / 15) - 7;
+    if (!fb) jraw(L",\n");
+    fb = false;
+    wchar_t b[160];
+    wsprintfW(b, L"{\"dx\":%d,\"dy\":%d,\"same_thread\":%u,\"same_target\":%u,\"same_color\":%u,\"n\":%lu}", dx, dy,
+              flags & 1u, (flags >> 1) & 1u, (flags >> 2) & 1u, static_cast<unsigned long>(s.dup_bins[i]));
+    jraw(b);
+  }
+  jput(L']');
+  jkv(&f, "far", s.counters[kDupFar]);
+  jkv(&f, "pairs", s.counters[kDupPairs]);
+  jkv(&f, "runs", s.counters[kDupRuns]);
+  jkv(&f, "torn", s.counters[kDupTorn]);
+  jkey(&f, "dt_log2");
+  jput(L'[');
+  for (uint32_t i = 0; i < kDtBins; ++i) {
+    if (i != 0) jput(L',');
+    ju64(s.dup_dt[i]);
+  }
+  jraw(L"]}");
+  jraw(L"\n");
+
+  jkey(&top, "frame");
+  f = true;
+  jput(L'{');
+  jkv(&f, "gap_ms", kBurstGapMs);
+  jkv(&f, "count", s.frame_count);
+  jkv(&f, "sum_us", s.frame_sum_us);
+  jkv(&f, "max_us", s.frame_max_us);
+  jkv(&f, "bin_us", kFrameBinUs);
+  jkey(&f, "hist");
+  jput(L'[');
+  for (uint32_t i = 0; i < kFrameBins; ++i) {
+    if (i != 0) jput(L',');
+    ju64(s.frame_hist[i]);
+  }
+  jput(L']');
+  jkey(&f, "pause_log2");
+  jput(L'[');
+  for (uint32_t i = 0; i < kPauseBins; ++i) {
+    if (i != 0) jput(L',');
+    ju64(s.frame_pause[i]);
+  }
+  jput(L']');
+  jkv(&f, "overhead_ticks", s.frame_overhead_ticks);
+  jkv(&f, "orig_ticks", s.frame_orig_ticks);
+  jkv(&f, "qpc_freq", s.qpc_freq);
+  jput(L'}');
+  jraw(L"\n");
+
+  jkey(&top, "timeline");
+  f = true;
+  jput(L'{');
+  jkv(&f, "bucket_ms", kBucketMs);
+  jkey(&f, "buckets");
+  jput(L'[');
+  bool fl = true;
+  for (uint32_t i = 0; i < kBuckets; ++i) {
+    const uint32_t* c = s.timeline[i];
+    if ((c[0] | c[1] | c[2] | c[3]) == 0) continue;
+    if (!fl) jraw(L",\n");
+    fl = false;
+    wchar_t b[96];
+    wsprintfW(b, L"[%lu,%lu,%lu,%lu,%lu]", static_cast<unsigned long>(i), static_cast<unsigned long>(c[0]),
+              static_cast<unsigned long>(c[1]), static_cast<unsigned long>(c[2]), static_cast<unsigned long>(c[3]));
+    jraw(b);
+  }
+  jraw(L"]}}\n");
+  jflush();
+}
+
+int dump_with_dll(const Target& t, const DllImage& dll) {
+  DWORD err = 0;
+  OurModules m;
+  if (!scan_our_modules(t.pid, nullptr, dll.path, &m, &err)) {
+    return fail(kWinApi, L"снимок модулей pid %lu: ошибка %lu", t.pid, err);
+  }
+  if (!m.any[kProbe]) return fail(kNotLoaded, L"probe не загружена в pid %lu", t.pid);
+  if (!m.ours[kProbe]) {
+    return fail(kForeign, L"в pid %lu модуль с именем %s из другого каталога — не трогаю", t.pid,
+                kDllNames[kProbe][kArchIndex]);
+  }
+  // До открытия на запись: модуль в памяти — тот же файл (RVA DtDump и DtSnapshot из файла).
+  HANDLE rd = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, t.pid);
+  if (rd == nullptr) return fail(kWinApi, L"OpenProcess (чтение) pid %lu: ошибка %lu", t.pid, GetLastError());
+  bool same = headers_match(rd, m.base[kProbe], dll);
+  CloseHandle(rd);
+  if (!same) {
+    return fail(kForeign, L"модуль в pid %lu не совпадает с файлом %s (пересобран?) — не трогаю", t.pid,
+                kDllNames[kProbe][kArchIndex]);
+  }
+  HANDLE proc = nullptr;
+  int rc = open_for_write(t, &proc);
+  if (rc != kOk) return rc;
+  DWORD code = 0;
+  CallResult r = remote_call(proc, m.base[kProbe] + dll.rva_dump, nullptr, kDumpTimeoutMs, &code, &err);
+  if (r == kCallTimeout) {
+    rc = fail(kDumpFailed, L"DtDump в pid %lu не завершился за %lu с; снимок не читаю", t.pid, kDumpTimeoutMs / 1000);
+  } else if (r == kCallError) {
+    rc = fail(kWinApi, L"поток DtDump в pid %lu: ошибка %lu", t.pid, err);
+  } else if (code != 0) {
+    rc = fail(kDumpFailed, L"DtDump в pid %lu вернул %lu (1 — probe не активна, 2 — ошибка)", t.pid, code);
+  } else {
+    dt::snap::ProbeSnapshot* s = static_cast<dt::snap::ProbeSnapshot*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(dt::snap::ProbeSnapshot)));
+    if (s == nullptr) {
+      rc = fail(kWinApi, L"нет памяти под снимок");
+    } else {
+      SIZE_T got = 0;
+      if (!ReadProcessMemory(proc, m.base[kProbe] + dll.rva_snapshot, s, sizeof(*s), &got) || got != sizeof(*s)) {
+        rc = fail(kWinApi, L"ReadProcessMemory снимка в pid %lu: ошибка %lu", t.pid, GetLastError());
+      } else if (!snapshot_valid(s)) {
+        rc = fail(kDumpFailed, L"снимок pid %lu не прошёл проверку (magic, версия, размер, Machine, счётчики)", t.pid);
+      } else {
+        print_snapshot(*s);
+        rc = kOk;
+      }
+      HeapFree(GetProcessHeap(), 0, s);
+    }
+  }
+  CloseHandle(proc);
+  return rc;
+}
+
+// Те же проверки цели, что у выгрузки, без 25-секундного наблюдения; блокировка
+// операции держится всю команду.
+int cmd_dump(DWORD want) {
+  Target t;
+  int rc = select_target(want, &t);
+  if (rc != kOk) return rc;
+  rc = check_bitness(t);
+  HANDLE op = nullptr;
+  if (rc == kOk) rc = acquire_op_lock(t.pid, &op);
+  if (rc == kOk) {
+    DllImage dll;
+    DllStatus ds = open_dll(kProbe, &dll);
+    if (ds != kDllOk) {
+      rc = fail(kBadDll, L"%s: %s (нужен для RVA DtDump/DtSnapshot)", kDllNames[kProbe][kArchIndex],
+                dll_status_text(ds));
+    } else {
+      rc = dump_with_dll(t, dll);
+      close_dll(&dll);
+    }
+  }
+  release_op_lock(&op);
+  close_target(&t);
+  return rc;
+}
+
+// ---------------------------------------------------------------------------
 // Состояние: без заголовков окон
 
 const wchar_t* module_text(const OurModules& m, Kind k) {
@@ -1258,10 +1706,7 @@ int wmain(int argc, wchar_t** argv) {
   if (eq(cmd, L"probe-load")) return cmd_load(kProbe, pid);
   if (eq(cmd, L"probe-unload")) return cmd_unload(kProbe, pid);
   if (eq(cmd, L"status")) return cmd_status(pid);
-  if (eq(cmd, L"probe-dump")) {
-    warn(L"probe-dump: не реализовано (данные probe — веха M3b)\n");
-    return kUsage;
-  }
+  if (eq(cmd, L"probe-dump")) return cmd_dump(pid);
   if (!eq(cmd, L"help") && !eq(cmd, L"--help") && !eq(cmd, L"-h") && !eq(cmd, L"/?")) {
     warn(L"неизвестная команда: %s\n", cmd);
   }
